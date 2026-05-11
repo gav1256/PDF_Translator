@@ -79,7 +79,7 @@ def _select_files(pdf_files):
     return []
 
 
-def _process_file(pdf_path, model_choice, input_lang, output_lang, extra_specs, file_num, total):
+def _process_file(pdf_path, model_choice, input_lang, output_lang, extra_specs, add_nekkudot, file_num, total):
     """Run the full extraction → translation → format → organise pipeline for one file."""
     base_name = os.path.splitext(os.path.basename(pdf_path))[0]
     prefix = f"  [{file_num}/{total}]"
@@ -105,6 +105,14 @@ def _process_file(pdf_path, model_choice, input_lang, output_lang, extra_specs, 
     except Exception as e:
         print(f"{prefix}  ✗ CRITICAL ERROR during translation: {e}")
         return False
+
+    if add_nekkudot:
+        print(f"{prefix}  [2.5/4] Applying Nekkudot via Dicta API...")
+        try:
+            from dicta_api_nekkudot import apply_nekkudot_to_text
+            translated_text = apply_nekkudot_to_text(translated_text)
+        except Exception as e:
+            print(f"{prefix}  ✗ WARNING: Failed to apply nekkudot: {e}")
 
     # Step 3: Formatting
     print(f"{prefix}  [3/4] Generating output files (Markdown & Word)...")
@@ -213,6 +221,19 @@ def main():
         "    (Press Enter for none): "
     ).strip()
 
+    # ── 5. Nekkudot (Hebrew Vowels) ─────────────────────────────
+    add_nekkudot = False
+    if "hebrew" in output_lang.lower():
+        while True:
+            nek_choice = input("\n[5] Add Nekkudot to Hebrew output? (YES/NO): ").strip().upper()
+            if nek_choice in ['YES', 'Y']:
+                add_nekkudot = True
+                break
+            elif nek_choice in ['NO', 'N']:
+                add_nekkudot = False
+                break
+            print("  Invalid choice. Please enter YES or NO.")
+
     # ── EXECUTION ───────────────────────────────────────────────
     total = len(selected_files)
     print("\n" + "=" * 60)
@@ -224,7 +245,7 @@ def main():
     for i, filename in enumerate(selected_files, 1):
         pdf_path = os.path.join(INPUT_DIR, filename)
         success = _process_file(
-            pdf_path, model_choice, input_lang, output_lang, extra_specs, i, total
+            pdf_path, model_choice, input_lang, output_lang, extra_specs, add_nekkudot, i, total
         )
         (results["ok"] if success else results["fail"]).append(filename)
 
