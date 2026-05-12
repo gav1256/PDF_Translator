@@ -10,23 +10,14 @@ from dotenv import load_dotenv
 # Load .env once at the module level
 load_dotenv()
 
-def _build_system_prompt(input_lang, output_lang, extra_specs=""):
-    """
-    Constructs the system prompt dynamically.
-    """
-    specs = f" {extra_specs}" if extra_specs else ""
-    return (
-        f"You are an expert translator, translating {input_lang} to {output_lang} "
-        f"to keep the flow and nuance of the original text. "
-        f"DO NOT add additional ideas, commentary, or explanations.{specs}"
-    )
+from config import SYSTEM_PROMPT_PASS1, SYSTEM_PROMPT_PASS2
 
 def _call_gemini(text, system_prompt, api_key):
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model="gemini-2.0-flash", # Using flash for speed/cost as default
+        model="gemini-3.1-flash-lite", # Using flash for speed/cost as default
         contents=[text],
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
@@ -85,36 +76,37 @@ def _call_meta(text, system_prompt, api_key):
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"].strip()
 
-def call_translation_api(text, model_choice, input_lang, output_lang, extra_specs=""):
-    """
-    Orchestrates the translation call based on the model choice.
-    """
-    system_prompt = _build_system_prompt(input_lang, output_lang, extra_specs)
-    
-    # Map selection to internal functions and env keys
+def _get_api_config(model_choice):
+    """Internal helper to get model metadata and API key."""
     config = {
         1: ("Gemini", "GEMINI_API_KEY", _call_gemini),
         2: ("OpenAI", "OPENAI_API_KEY", _call_openai),
         3: ("Claude", "ANTHROPIC_API_KEY", _call_claude),
         4: ("MetaAI", "META_API_KEY", _call_meta)
     }
-    
     name, env_key, func = config.get(model_choice, (None, None, None))
-    
     if not func:
         raise ValueError("Invalid model choice.")
-    
     api_key = os.getenv(env_key)
     if not api_key:
         raise ValueError(f"API key for {name} ({env_key}) not found in .env file.")
+    return name, api_key, func
+
+def run_pass1(text, model_choice, input_lang, output_lang, extra_specs=""):
+    """
+    Runs Pass 1 (Drafting) for all chunks.
+    Returns (combined_draft, chunk_data) where chunk_data is a list of (orig_chunk, draft_chunk).
+    """
+    name, api_key, func = _get_api_config(model_choice)
+    prompt1 = SYSTEM_PROMPT_PASS1.format(source_lang=input_lang, target_lang=output_lang)
+    if extra_specs:
+        prompt1 += f"\n\nAdditional Specifications: {extra_specs}"
 
     # Implementation of a simple chunker to avoid token limits
-    # Max ~4000 characters per chunk for safety across all models
-    MAX_CHUNK_SIZE = 4000
+    MAX_CHUNK_SIZE = 50000
     paragraphs = text.split('\n\n')
     chunks = []
     current_chunk = ""
-    
     for p in paragraphs:
         if len(current_chunk) + len(p) < MAX_CHUNK_SIZE:
             current_chunk += ("\n\n" if current_chunk else "") + p
@@ -124,17 +116,49 @@ def call_translation_api(text, model_choice, input_lang, output_lang, extra_spec
             current_chunk = p
     if current_chunk:
         chunks.append(current_chunk)
-    
+
+    chunk_data = []
     results = []
-    print(f"\n  [Translator] Processing {len(chunks)} chunks via {name}...")
+    print(f"\n  [Translator] Running Pass 1 ({len(chunks)} chunks) via {name}...")
     for i, chunk in enumerate(chunks):
-        print(f"    - Chunk {i+1}/{len(chunks)}...", end="", flush=True)
+        print(f"    - Chunk {i+1}/{len(chunks)}... (Drafting)", end="", flush=True)
         try:
-            translated = func(chunk, system_prompt, api_key)
-            results.append(translated)
+            draft = func(chunk, prompt1, api_key)
+            chunk_data.append((chunk, draft))
+            results.append(draft)
             print(" Done")
         except Exception as e:
             print(f" Failed: {e}")
-            results.append(f"\n[ERROR TRANSLATING CHUNK {i+1}: {e}]\n")
+            results.append(f"\n[ERROR PASS 1 CHUNK {i+1}: {e}]\n")
+            chunk_data.append((chunk, None))
+            
+    return "\n\n".join(results), chunk_data
+
+def run_pass2(chunk_data, model_choice, input_lang, output_lang, extra_specs=""):
+    """
+    Runs Pass 2 (Reconstruction) using matched chunk data.
+    Returns combined_final_text.
+    """
+    name, api_key, func = _get_api_config(model_choice)
+    prompt2 = SYSTEM_PROMPT_PASS2.format(source_lang=input_lang, target_lang=output_lang)
+    if extra_specs:
+        prompt2 += f"\n\nAdditional Specifications: {extra_specs}"
+
+    results = []
+    print(f"\n  [Translator] Running Pass 2 ({len(chunk_data)} chunks) via {name}...")
+    for i, (orig_chunk, draft_chunk) in enumerate(chunk_data):
+        if not draft_chunk:
+            results.append(f"\n[SKIPPED PASS 2 CHUNK {i+1}: Pass 1 failed]\n")
+            continue
+            
+        print(f"    - Chunk {i+1}/{len(chunk_data)}... (Reconstructing)", end="", flush=True)
+        try:
+            pass2_input = f"--- ORIGINAL FRAGMENTS ---\n{orig_chunk}\n\n--- DRAFT TRANSLATION ---\n{draft_chunk}"
+            reconstructed = func(pass2_input, prompt2, api_key)
+            results.append(reconstructed)
+            print(" Done")
+        except Exception as e:
+            print(f" Failed: {e}")
+            results.append(f"\n[ERROR PASS 2 CHUNK {i+1}: {e}]\n")
             
     return "\n\n".join(results)

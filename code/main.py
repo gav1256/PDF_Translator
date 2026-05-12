@@ -7,8 +7,9 @@ import os
 import sys
 import re
 import shutil
+import argparse
 from extractor import extract_text
-from translator import call_translation_api
+from translator import run_pass1, run_pass2
 from formatter import save_markdown, save_word
 
 # Resolve paths relative to this script's parent dir (project root)
@@ -79,70 +80,14 @@ def _select_files(pdf_files):
     return []
 
 
-def _process_file(pdf_path, model_choice, input_lang, output_lang, extra_specs, add_nekkudot, file_num, total):
-    """Run the full extraction → translation → format → organise pipeline for one file."""
-    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    prefix = f"  [{file_num}/{total}]"
-
-    print(f"\n{'─' * 60}")
-    print(f"{prefix}  Processing: {os.path.basename(pdf_path)}")
-    print(f"{'─' * 60}")
-
-    # Step 1: Extraction
-    print(f"{prefix}  [1/4] Extracting text from PDF...")
-    try:
-        extracted_text = extract_text(pdf_path)
-    except Exception as e:
-        print(f"{prefix}  ✗ CRITICAL ERROR during extraction: {e}")
-        return False
-
-    # Step 2: Translation
-    print(f"{prefix}  [2/4] Calling LLM API ({input_lang} -> {output_lang})...")
-    try:
-        translated_text = call_translation_api(
-            extracted_text, model_choice, input_lang, output_lang, extra_specs
-        )
-    except Exception as e:
-        print(f"{prefix}  ✗ CRITICAL ERROR during translation: {e}")
-        return False
-
-    if add_nekkudot:
-        print(f"{prefix}  [2.5/4] Applying Nekkudot via Dicta API...")
-        try:
-            from dicta_api_nekkudot import apply_nekkudot_to_text
-            translated_text = apply_nekkudot_to_text(translated_text)
-        except Exception as e:
-            print(f"{prefix}  ✗ WARNING: Failed to apply nekkudot: {e}")
-
-    # Step 3: Formatting
-    print(f"{prefix}  [3/4] Generating output files (Markdown & Word)...")
-    md_filename = f"{base_name}.md"
-    docx_filename = f"{base_name}.docx"
-
-    # Write temp outputs next to the code dir, then move
-    md_path = save_markdown(translated_text, md_filename)
-    docx_path = save_word(translated_text, docx_filename, output_lang)
-
-    # Step 4: Organisation — each file gets its own output subfolder
-    print(f"{prefix}  [4/4] Organizing files...")
-    file_output_dir = os.path.join(OUTPUT_DIR, base_name)
-    os.makedirs(file_output_dir, exist_ok=True)
-
-    try:
-        # Copy original PDF into output
-        shutil.copy2(pdf_path, os.path.join(file_output_dir, os.path.basename(pdf_path)))
-        # Move generated files
-        shutil.move(md_path, os.path.join(file_output_dir, md_filename))
-        shutil.move(docx_path, os.path.join(file_output_dir, docx_filename))
-
-        print(f"{prefix}  ✓ Done → {file_output_dir}")
-        return True
-    except Exception as e:
-        print(f"{prefix}  ✗ ERROR during file organization: {e}")
-        return False
-
-
 def main():
+    parser = argparse.ArgumentParser(description="Modular Translation System CLI")
+    parser.add_argument("--multi-pass", action="store_true", help="Run multi-pass reconstruction for formatting")
+    args = parser.parse_args()
+    
+    run_multi_pass = args.multi_pass
+    has_multi_pass_flag = "--multi-pass" in sys.argv
+
     clear_screen()
     print("=" * 60)
     print("      Modular Translation System CLI")
@@ -185,10 +130,6 @@ def main():
     if not selected_files:
         print("  No files selected. Exiting.")
         sys.exit(0)
-
-    print(f"\n  Final selection ({len(selected_files)} file(s)):")
-    for name in selected_files:
-        print(f"    • {name}")
 
     # ── 3. Translation Settings ─────────────────────────────────
     print("\n[3] TRANSLATION SETTINGS:")
@@ -234,29 +175,134 @@ def main():
                 break
             print("  Invalid choice. Please enter YES or NO.")
 
-    # ── EXECUTION ───────────────────────────────────────────────
-    total = len(selected_files)
-    print("\n" + "=" * 60)
-    print(f"  STARTING PIPELINE — {total} file(s)")
-    print("=" * 60)
+    # ── 6. Initial Multi-Pass choice ────────────────────────────
+    if not has_multi_pass_flag:
+        while True:
+            mp_choice = input("\n[6] Run multi-pass reconstruction for all files? (y/N): ").strip().lower()
+            if mp_choice in ['y', 'yes']:
+                run_multi_pass = True
+                break
+            elif mp_choice in ['n', 'no', '']:
+                run_multi_pass = False
+                break
+            print("  Invalid choice. Please enter y or n.")
 
+    # ── PHASE 1: Extraction & Pass 1 ────────────────────────────
+    print("\n" + "=" * 60)
+    print(f"  PHASE 1: DRAFTING ({len(selected_files)} file(s))")
+    print("=" * 60)
+    
+    file_data = {}
     results = {"ok": [], "fail": []}
 
     for i, filename in enumerate(selected_files, 1):
         pdf_path = os.path.join(INPUT_DIR, filename)
-        success = _process_file(
-            pdf_path, model_choice, input_lang, output_lang, extra_specs, add_nekkudot, i, total
-        )
-        (results["ok"] if success else results["fail"]).append(filename)
+        base_name = os.path.splitext(filename)[0]
+        output_dir = os.path.join(OUTPUT_DIR, base_name)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"\n  [{i}/{len(selected_files)}] Processing: {filename}")
+        
+        try:
+            # 1. Extraction
+            print(f"    - Extracting text...")
+            extracted_text = extract_text(pdf_path)
+            
+            # 2. Pass 1
+            translated_text, chunk_data = run_pass1(extracted_text, model_choice, input_lang, output_lang, extra_specs)
+            
+            # 3. Save Draft MD
+            md_path = os.path.join(output_dir, f"{base_name}.md")
+            save_markdown(translated_text, md_path)
+            
+            file_data[filename] = {
+                'pdf_path': pdf_path,
+                'chunk_data': chunk_data,
+                'text': translated_text,
+                'output_dir': output_dir,
+                'base_name': base_name,
+                'md_path': md_path
+            }
+            results["ok"].append(filename)
+        except Exception as e:
+            print(f"    ✗ FAILED: {e}")
+            results["fail"].append(filename)
+
+    # ── PHASE 2: Review Pause & Selective Pass 2 ────────────────
+    files_to_reconstruct = []
+    if results["ok"]:
+        if run_multi_pass:
+            # If globally enabled, all successful files go to pass 2
+            files_to_reconstruct = results["ok"]
+        else:
+            print("\n" + "=" * 60)
+            print("  DRAFTS SAVED. Please review the .md files in the output folders.")
+            print("=" * 60)
+            
+            do_pass2 = input("\n[7] Run 2nd Pass (Reconstruction) on any of these files? (y/N): ").strip().lower()
+            if do_pass2 in ['y', 'yes']:
+                if len(results["ok"]) > 1:
+                    print("\n  Select file(s) for 2nd Pass:")
+                    for idx, name in enumerate(results["ok"], 1):
+                        print(f"    {idx}) {name}")
+                    files_to_reconstruct = _select_files(results["ok"])
+                else:
+                    files_to_reconstruct = results["ok"]
+
+    # Run Pass 2
+    if files_to_reconstruct:
+        print("\n" + "=" * 60)
+        print(f"  PHASE 2: RECONSTRUCTION ({len(files_to_reconstruct)} file(s))")
+        print("=" * 60)
+        for filename in files_to_reconstruct:
+            data = file_data[filename]
+            print(f"\n  Reconstructing: {filename}")
+            try:
+                final_text = run_pass2(data['chunk_data'], model_choice, input_lang, output_lang, extra_specs)
+                data['text'] = final_text
+                save_markdown(final_text, data['md_path']) # Overwrite with Pass 2 result
+            except Exception as e:
+                print(f"    ✗ Pass 2 Failed for {filename}: {e}")
+
+    # ── PHASE 3: Finalization (Nekkudot & Word) ─────────────────
+    if results["ok"]:
+        print("\n" + "=" * 60)
+        print(f"  PHASE 3: FINALIZING ({len(results['ok'])} file(s))")
+        print("=" * 60)
+        for filename in results["ok"]:
+            data = file_data[filename]
+            text = data['text']
+            
+            print(f"\n  Finalizing: {filename}")
+            
+            # 1. Apply Nekkudot if requested
+            if add_nekkudot:
+                print(f"    - Applying Nekkudot...")
+                try:
+                    from dicta_api_nekkudot import apply_nekkudot_to_text
+                    text = apply_nekkudot_to_text(text)
+                    save_markdown(text, data['md_path']) # Update MD with nekkudot
+                except Exception as e:
+                    print(f"    ✗ Nekkudot failed: {e}")
+                
+            # 2. Save Word document
+            print(f"    - Generating Word document...")
+            docx_path = os.path.join(data['output_dir'], f"{data['base_name']}.docx")
+            save_word(text, docx_path, output_lang)
+            
+            # 3. Copy original PDF to output
+            shutil.copy2(data['pdf_path'], os.path.join(data['output_dir'], filename))
+            print(f"    ✓ Done → {data['output_dir']}")
 
     # ── SUMMARY ─────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  PIPELINE COMPLETE!")
     print("=" * 60)
     if results["ok"]:
-        print(f"  ✓ Succeeded: {len(results['ok'])}")
+        print(f"  ✓ Processed: {len(results['ok'])}")
         for name in results["ok"]:
-            print(f"      • {name}")
+            is_recon = " (2nd Pass applied)" if name in files_to_reconstruct else ""
+            print(f"      • {name}{is_recon}")
     if results["fail"]:
         print(f"  ✗ Failed:    {len(results['fail'])}")
         for name in results["fail"]:
