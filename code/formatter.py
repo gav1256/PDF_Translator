@@ -345,8 +345,10 @@ def _pair_runs(content_blocks, source_hebrew, target_hebrew):
 def save_word_columns(text, output_path, source_lang, target_lang, opts=DEFAULT_OPTIONS):
     """
     Two-column table: [target | source] (or [source | target] when
-    opts.swap_columns).  Headings and '## Page N' markers become full-width
-    rows spanning both columns; content is paired by _pair_runs (script-aware).
+    opts.swap_columns).  Headings pair across the columns exactly like body
+    text — bold, centred, at heading size — so a title reads across the page
+    beside its translation.  '## Page N' markers start a new page rather than
+    printing the marker.  Pairing is done by _pair_runs (script-aware).
     """
     source_hebrew = "hebrew" in source_lang.lower()
     target_hebrew = "hebrew" in target_lang.lower()
@@ -358,58 +360,76 @@ def save_word_columns(text, output_path, source_lang, target_lang, opts=DEFAULT_
     table.columns[0].width = col_width
     table.columns[1].width = col_width
 
-    def add_full_width(clean, level):
-        row = table.add_row()
-        cell = row.cells[0].merge(row.cells[1])
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        size = Pt(opts.heading_pt(level)) if level else Pt(opts.body_pt + 1)
-        heb = _is_hebrew_text(clean)
-        # bold the whole label, but don't double-wrap text that is already **bold**
-        body = clean if '**' in clean else f"**{clean}**"
-        _add_formatted_runs(p, body, heb, opts.font_for(heb), size)
-        _apply_para_format(p, opts)
+    pending_break = [False]   # the next row opens a new page
 
-    def _fill(cell, text_, is_hebrew, force):
+    def _fill(cell, text_, is_hebrew, force, size, center):
         p = cell.paragraphs[0]
         _add_formatted_runs(p, text_, is_hebrew, opts.font_for(is_hebrew),
-                            Pt(opts.body_pt), force_bold=force)
-        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT if is_hebrew else WD_ALIGN_PARAGRAPH.LEFT
+                            size, force_bold=force)
+        if center:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            p.alignment = (WD_ALIGN_PARAGRAPH.RIGHT if is_hebrew
+                           else WD_ALIGN_PARAGRAPH.LEFT)
         if is_hebrew:
             _set_rtl(p)
-        _apply_para_format(p, opts, justify_ok=True)
+        if pending_break[0]:
+            p.paragraph_format.page_break_before = True
+        # headings keep their centring; only body text may be justified
+        _apply_para_format(p, opts, justify_ok=not center)
 
-    def add_pair(source, target):
-        # Mirror whole-paragraph bold: if either side is a single **…** span,
-        # bold both cells (keeps a fully-bold quote bold even if the LLM dropped
-        # the ** on one column).
-        force = _is_whole_bold(source) or _is_whole_bold(target)
+    def add_row(source, target, size, force, center=False):
         row = table.add_row()
         left, right = row.cells[0], row.cells[1]
         if opts.swap_columns:
-            _fill(left, source, source_hebrew, force)
-            _fill(right, target, target_hebrew, force)
+            _fill(left, source, source_hebrew, force, size, center)
+            _fill(right, target, target_hebrew, force, size, center)
         else:
-            _fill(left, target, target_hebrew, force)
-            _fill(right, source, source_hebrew, force)
+            _fill(left, target, target_hebrew, force, size, center)
+            _fill(right, source, source_hebrew, force, size, center)
+        pending_break[0] = False
 
-    # Split the stream into structural markers (full-width) and content runs,
-    # pairing each content run independently so a heading resets alignment.
+    # Headings and body text are buffered separately, and each buffer is paired
+    # on its own, so a title lines up with its translation rather than with the
+    # paragraph that follows it.
     content_buf = []
+    heading_buf = []
 
     def flush_content():
         for src, tgt in _pair_runs(content_buf, source_hebrew, target_hebrew):
-            add_pair(src, tgt)
+            # Mirror whole-paragraph bold: if either side is a single **…**
+            # span, bold both cells (keeps a fully-bold quote bold even if the
+            # LLM dropped the ** on one column).
+            force = _is_whole_bold(src) or _is_whole_bold(tgt)
+            add_row(src, tgt, Pt(opts.body_pt), force)
         content_buf.clear()
+
+    def flush_headings():
+        if not heading_buf:
+            return
+        levels = {clean: level for level, clean in heading_buf}
+        texts = [clean for _level, clean in heading_buf]
+        for src, tgt in _pair_runs(texts, source_hebrew, target_hebrew):
+            level = levels.get(src) or levels.get(tgt) or heading_buf[0][0]
+            add_row(src, tgt, Pt(opts.heading_pt(level)), True, center=True)
+        heading_buf.clear()
 
     for block in _blocks(text):
         line_type, level, clean = _parse_line_type(block)
-        if line_type in ('page_break', 'heading'):
+        if line_type == 'page_break':
+            flush_headings()
             flush_content()
-            label = clean if line_type == 'heading' else re.sub(r'^#+\s+', '', block)
-            add_full_width(label, level)
+            # The source page number is structure, not something the reader
+            # wants printed: break the page instead of writing the marker.
+            if len(table.rows):
+                pending_break[0] = True
+        elif line_type == 'heading':
+            flush_content()
+            heading_buf.append((level, clean))
         else:
+            flush_headings()
             content_buf.append(block)
+    flush_headings()
     flush_content()
 
     doc.save(output_path)
