@@ -18,11 +18,11 @@ if not exist ".env" (
 
 :: Check for dependencies
 echo [1/2] Ensuring dependencies are installed...
-python -m pip install -r code\requirements.txt --quiet
+py -m pip install -r code\requirements.txt --quiet
 
 :: Run the program
 echo [2/2] Starting translation system...
-python code\main.py
+py code\main.py
 
 echo.
 echo ============================================

@@ -8,9 +8,18 @@ import sys
 import re
 import shutil
 import argparse
+
+# Fix Windows console encoding for Hebrew output
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 from extractor import extract_text
-from translator import run_pass1, run_pass2
-from formatter import save_markdown, save_word
+from translator import (run_pass1, run_pass2, run_pass3,
+                        verify_provider, provider_name)
+from formatter import save_markdown, save_word, save_word_columns
+from config import build_prompts
 
 # Resolve paths relative to this script's parent dir (project root)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -93,21 +102,31 @@ def main():
     print("      Modular Translation System CLI")
     print("=" * 60)
 
-    # ── 1. Model Selection ──────────────────────────────────────
+    # ── 1. Model Selection (with live key verification) ─────────
     print("\n[1] SELECT LLM PROVIDER:")
     print("    1. Gemini")
     print("    2. OpenAI")
     print("    3. Claude")
-    print("    4. MetaAI")
 
     while True:
+        raw = input("\n  Enter choice (1-3): ").strip()
         try:
-            model_choice = int(input("\n  Enter choice (1-4): ").strip())
-            if 1 <= model_choice <= 4:
-                break
-            print("  Invalid choice. Please enter a number between 1 and 4.")
+            model_choice = int(raw)
         except ValueError:
             print("  Invalid input. Please enter a number.")
+            continue
+        if not 1 <= model_choice <= 3:
+            print("  Invalid choice. Please enter a number between 1 and 3.")
+            continue
+
+        print(f"  - Verifying {provider_name(model_choice)} API key...")
+        ok, msg = verify_provider(model_choice)
+        if ok:
+            print(f"  ✓ {msg}")
+            break
+        # Key missing or invalid — notify and let the user pick another provider.
+        print(f"  ✗ {msg}")
+        print("    Fix the key in your .env file, or choose a different provider.")
 
     # ── 2. File Selection from input/ folder ────────────────────
     print("\n[2] FILE INPUT:")
@@ -135,9 +154,10 @@ def main():
     print("\n[3] TRANSLATION SETTINGS:")
     print("    a) Hebrew to English")
     print("    b) English to Hebrew")
-    print("    c) Torah/Rabbinic Hebrew to English")
+    print("    c) Torah/Rabbinic Hebrew to English (Modern-Orthodox / Yeshivish voice)")
     print("    d) Custom")
 
+    rabbinic = False
     while True:
         lang_choice = input("\n  Enter choice (a-d): ").strip().lower()
         if lang_choice == 'a':
@@ -148,6 +168,7 @@ def main():
             break
         elif lang_choice == 'c':
             input_lang, output_lang = "Torah/Rabbinic Hebrew", "English"
+            rabbinic = True
             break
         elif lang_choice == 'd':
             input_lang = input("  Enter input language: ").strip()
@@ -155,6 +176,23 @@ def main():
             if input_lang and output_lang:
                 break
         print("  Invalid choice.")
+
+    # ── 3b. Output Layout (all directions) ──────────────────────
+    print("\n[3b] OUTPUT LAYOUT:")
+    print("    1) Translation only")
+    print(f"    2) {input_lang} + {output_lang}, paragraph after the other (stacked)")
+    print(f"    3) {input_lang} + {output_lang}, side-by-side columns")
+
+    while True:
+        layout_choice = input("\n  Enter choice (1-3): ").strip()
+        if layout_choice in ('1', '2', '3'):
+            layout = {'1': 'mono', '2': 'stacked', '3': 'columns'}[layout_choice]
+            break
+        print("  Invalid choice. Please enter 1, 2, or 3.")
+
+    bilingual = layout in ('stacked', 'columns')
+    pass1_prompt, pass2_prompt, pass3_prompt = build_prompts(
+        rabbinic=rabbinic, bilingual=bilingual)
 
     # ── 4. Additional Specifications ────────────────────────────
     extra_specs = input(
@@ -176,7 +214,12 @@ def main():
             print("  Invalid choice. Please enter YES or NO.")
 
     # ── 6. Initial Multi-Pass choice ────────────────────────────
-    if not has_multi_pass_flag:
+    # A bilingual layout REQUIRES pass 2 — that is where the source and target
+    # are interleaved — so it runs automatically and the prompt is skipped.
+    if bilingual:
+        run_multi_pass = True
+        print("\n[6] Bilingual layout selected — 2nd pass (interleaving) runs automatically.")
+    elif not has_multi_pass_flag:
         while True:
             mp_choice = input("\n[6] Run multi-pass reconstruction for all files? (y/N): ").strip().lower()
             if mp_choice in ['y', 'yes']:
@@ -186,6 +229,17 @@ def main():
                 run_multi_pass = False
                 break
             print("  Invalid choice. Please enter y or n.")
+
+    # ── 7. Optional 3rd-pass smoothing ──────────────────────────
+    do_smoothing = False
+    while True:
+        sm = input("\n[7] Run 3rd-pass smoothing (polish flow / connect sentences)? (y/N): ").strip().lower()
+        if sm in ['y', 'yes']:
+            do_smoothing = True
+            break
+        elif sm in ['n', 'no', '']:
+            break
+        print("  Invalid choice. Please enter y or n.")
 
     # ── PHASE 1: Extraction & Pass 1 ────────────────────────────
     print("\n" + "=" * 60)
@@ -209,8 +263,15 @@ def main():
             extracted_text = extract_text(pdf_path)
             
             # 2. Pass 1
-            translated_text, chunk_data = run_pass1(extracted_text, model_choice, input_lang, output_lang, extra_specs)
-            
+            translated_text, chunk_data = run_pass1(
+                extracted_text, model_choice, input_lang, output_lang,
+                extra_specs, pass1_prompt=pass1_prompt)
+
+            # If every chunk failed (e.g. auth/quota died mid-run), don't
+            # produce a garbage document — mark the file as failed.
+            if chunk_data and all(draft is None for _orig, draft in chunk_data):
+                raise RuntimeError("all chunks failed in Pass 1 (API error?)")
+
             # 3. Save Draft MD
             md_path = os.path.join(output_dir, f"{base_name}.md")
             save_markdown(translated_text, md_path)
@@ -239,7 +300,7 @@ def main():
             print("  DRAFTS SAVED. Please review the .md files in the output folders.")
             print("=" * 60)
             
-            do_pass2 = input("\n[7] Run 2nd Pass (Reconstruction) on any of these files? (y/N): ").strip().lower()
+            do_pass2 = input("\n[8] Run 2nd Pass (Reconstruction) on any of these files? (y/N): ").strip().lower()
             if do_pass2 in ['y', 'yes']:
                 if len(results["ok"]) > 1:
                     print("\n  Select file(s) for 2nd Pass:")
@@ -258,11 +319,30 @@ def main():
             data = file_data[filename]
             print(f"\n  Reconstructing: {filename}")
             try:
-                final_text = run_pass2(data['chunk_data'], model_choice, input_lang, output_lang, extra_specs)
+                final_text = run_pass2(
+                    data['chunk_data'], model_choice, input_lang, output_lang,
+                    extra_specs, pass2_prompt=pass2_prompt)
                 data['text'] = final_text
                 save_markdown(final_text, data['md_path']) # Overwrite with Pass 2 result
             except Exception as e:
                 print(f"    ✗ Pass 2 Failed for {filename}: {e}")
+
+    # ── PHASE 2b: Optional 3rd-pass smoothing ───────────────────
+    if do_smoothing and results["ok"]:
+        print("\n" + "=" * 60)
+        print(f"  PHASE 2b: SMOOTHING ({len(results['ok'])} file(s))")
+        print("=" * 60)
+        for filename in results["ok"]:
+            data = file_data[filename]
+            print(f"\n  Smoothing: {filename}")
+            try:
+                smoothed = run_pass3(
+                    data['text'], model_choice, input_lang, output_lang,
+                    extra_specs, pass3_prompt=pass3_prompt)
+                data['text'] = smoothed
+                save_markdown(smoothed, data['md_path'])   # overwrite with smoothed result
+            except Exception as e:
+                print(f"    ✗ Pass 3 Failed for {filename}: {e}")
 
     # ── PHASE 3: Finalization (Nekkudot & Word) ─────────────────
     if results["ok"]:
@@ -285,14 +365,28 @@ def main():
                 except Exception as e:
                     print(f"    ✗ Nekkudot failed: {e}")
                 
-            # 2. Save Word document
-            print(f"    - Generating Word document...")
+            # 2. Save Word document in the chosen layout
+            print(f"    - Generating Word document ({layout})...")
             docx_path = os.path.join(data['output_dir'], f"{data['base_name']}.docx")
-            save_word(text, docx_path, output_lang)
+            if layout == 'columns':
+                save_word_columns(text, docx_path, input_lang, output_lang)
+            elif layout == 'stacked':
+                save_word(text, docx_path, output_lang, bilingual=True)
+            else:
+                save_word(text, docx_path, output_lang)
             
-            # 3. Copy original PDF to output
-            shutil.copy2(data['pdf_path'], os.path.join(data['output_dir'], filename))
-            print(f"    ✓ Done → {data['output_dir']}")
+            # 3. Move the original PDF out of input/ — a translated file lives
+            #    only in its output folder from here on.  Only files that made
+            #    it through the pipeline move; failures stay in input/.
+            dest_pdf = os.path.join(data['output_dir'], filename)
+            try:
+                if os.path.exists(dest_pdf):
+                    os.remove(dest_pdf)   # re-translation: replace the older copy
+                shutil.move(data['pdf_path'], dest_pdf)
+                print(f"    ✓ Done → {data['output_dir']}  (PDF moved out of input/)")
+            except Exception as e:
+                print(f"    ! PDF left in input/ — could not move it: {e}")
+                print(f"    ✓ Done → {data['output_dir']}")
 
     # ── SUMMARY ─────────────────────────────────────────────────
     print("\n" + "=" * 60)
